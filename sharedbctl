@@ -1,0 +1,179 @@
+#!/usr/bin/env python2
+
+from __future__ import division
+
+import getopt
+import libvirt
+import subprocess
+import sys
+import textwrap
+import threading
+
+# insert hostnames here
+ALL_HOSTNAMES = [] 
+
+# Copied from sync_dns.py - perhaps we should have a lightweight library
+def in_parallel(func, args, verbose):
+    threads = []
+    for arg in args:
+        t = threading.Thread(target=func, name=arg, args=(arg,))
+        t.setDaemon(True)
+        t.start()
+        threads.append(t)
+    prev_logged = -1
+    while threads:
+        if len(threads) != prev_logged:
+            if verbose:
+                sys.stderr.write("Waiting for %d remote job%s to complete [%s]\n" % (len(threads),
+                    len(threads) != 1 and "s" or "",
+                    ' '.join(t.getName() for t in threads)))
+            prev_logged = len(threads)
+        threads[0].join(1)
+        threads = filter(lambda x: x.isAlive(), threads)
+
+
+### status module
+
+states = {
+    libvirt.VIR_DOMAIN_NOSTATE: 'no state',
+    libvirt.VIR_DOMAIN_RUNNING: 'running',
+    libvirt.VIR_DOMAIN_BLOCKED: 'blocked',
+    libvirt.VIR_DOMAIN_PAUSED: 'paused',
+    libvirt.VIR_DOMAIN_SHUTDOWN: 'shutting down',
+    libvirt.VIR_DOMAIN_SHUTOFF: 'shut off',
+    libvirt.VIR_DOMAIN_CRASHED: 'crashed',
+}
+
+def pprint_table(table):
+    """Prints out a table of data, padded for alignment
+    @param table: The table to print. A list of lists. Each row must have the same number of columns.
+    """ 
+
+    col_paddings = []
+    for i in range(len(table[0])):
+        col_paddings.append(max([len(str(row[i])) for row in table]))
+
+    for row in table:
+        print row[0].ljust(col_paddings[0] + 1),
+        for i in range(1, len(row)):
+            print str(row[i]).ljust(col_paddings[i] + 2),
+        print
+
+containers = []
+def gather_data_onehost(host):
+
+    conn = libvirt.openReadOnly("lxc+ssh://" + host)
+    for domain in map(conn.lookupByName, conn.listDefinedDomains()) + map(conn.lookupByID, conn.listDomainsID()):
+        state, maxmem, mem, ncpu, cputime = domain.info()
+        containers.append({
+            'host': host,
+            'name': domain.name(),
+            'state': states.get(state, state),
+            'maxmem': maxmem // 1000, 
+            'usedmem': mem // 1000,
+            'ncpu': ncpu,
+            'cputime': cputime // 1000000000,
+            })
+
+def cmd_status():
+    '''Print a nice table of all guests with status information'''
+    in_parallel(gather_data_onehost, ALL_HOSTNAMES, verbose=True)
+    containers_header = ["name", "state", "max mem (MB)", "used mem (MB)", "CPU cores", "CPU time (sec)" ]
+    blankline = ["","","","","",""]
+    output = [ containers_header, blankline ]
+    for host in ALL_HOSTNAMES:
+        output.extend([[host, "","","",""],["===================", "","","","",""]])
+        hostoutput = [ ]
+        hostsummary = { 'maxmem': 0, 'usedmem': 0, 'ncpu': 0 }
+        for row in containers:
+            if row["host"] == host:
+                hostoutput.append([row["name"], row["state"], row["maxmem"],
+                str(row["usedmem"]) + (" " * (5 - len(str(row["usedmem"])))) + " (" + ( str(int(100*(row["usedmem"]/row["maxmem"]))) ) + " %)",
+                row["ncpu"], row["cputime"] ])
+                
+                hostsummary['maxmem'] += row["maxmem"]
+                hostsummary['usedmem'] += row["usedmem"]
+                hostsummary['ncpu'] += row["ncpu"]
+              
+        # sort by ncpu reverse, then name
+        hostoutput = sorted(hostoutput, key=lambda x: (-x[4], x[0]))
+        if hostoutput: 
+            output.extend(hostoutput)
+            output.append(blankline)
+            output.append(["total:", "", str(hostsummary['maxmem']), str(hostsummary['usedmem']), str(hostsummary['ncpu']), ""])
+        output.append(blankline)
+    pprint_table(output)
+
+
+### hostlist module
+
+def cmd_hostlist():
+    '''print a list of ShareDB hosts, suitable for use with pssh'''
+    print '\n'.join(ALL_HOSTNAMES)
+
+
+### guestlist module
+
+def cmd_guestlist(host=None):
+    '''print a list of (running) ShareDB guests, suitable for use with pssh'''
+    if host is None:
+        in_parallel(gather_data_onehost, ALL_HOSTNAMES, verbose=True)
+    else:
+        gather_data_onehost(host)
+    output = [ ]
+    for row in containers:
+        output.append(row["name"])
+    print "\n".join(sorted(output))
+
+def cmd_guestlist_by_dc(data_center):
+    '''print a list of (running) ShareDB guests in specified DC, suitable for use with pssh'''
+    in_parallel(gather_data_onehost, [x for x in ALL_HOSTNAMES if x.startswith(data_center)], verbose=True)
+    output = [ ]
+    for row in containers:
+        output.append(row["name"])
+    print "\n".join(sorted(output))
+
+
+def main():
+    try:
+        opts, args = getopt.gnu_getopt(sys.argv[1:], "h", ["help"])
+        for o, a in opts:
+            if o == "-h" or o == "--help":
+                raise getopt.GetoptError, "Show help"
+            else:
+                print "Unhandled option: " + o + ": " + a
+        if len(args) == 0:
+            command = cmd_status
+        else:
+            command = globals().get('cmd_' + args[0], None)
+        if command is None:
+            raise getopt.GetoptError, "No such command '%s'" % args[0]
+        command(*args[1:])
+    except getopt.GetoptError, e:
+        print "Usage: %s [OPTION]... cmd" % sys.argv[0]
+        print '''
+Options:
+    -h, --help       Display this help
+
+Commands:'''
+        scope = globals()
+        commands = [(x[4:], scope[x]) for x in scope if x.startswith('cmd_')]
+        commands.sort()
+        for name, cmdfunc in commands:
+            nameopts = [name]
+            for i in xrange(cmdfunc.func_code.co_argcount):
+                varname = cmdfunc.func_code.co_varnames[i]
+                if i >= cmdfunc.func_code.co_argcount - len(cmdfunc.func_defaults or ()):
+                    varname = "[" + varname + "]"
+                nameopts.append(varname)
+            print "    " + " ".join(nameopts)
+            print textwrap.fill(textwrap.dedent(cmdfunc.__doc__), width=80,
+                    initial_indent=' '*4, subsequent_indent=' '*4)
+            print
+        print '''
+Error: %s''' % e
+
+
+if __name__ == '__main__':
+    status = main()
+    sys.exit(status)
