@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 
 from __future__ import division
 
@@ -9,8 +9,24 @@ import sys
 import textwrap
 import threading
 
-# insert hostnames here
-ALL_HOSTNAMES = [] 
+
+try:                # Python 2
+    xrange
+except NameError:   # Python 3, xrange is now named range
+    xrange = range
+
+# new hosts probably go here
+SSD_HOSTS = [
+
+]
+
+
+SPINNING_RUST_HOSTS = [
+
+]
+
+ALL_HOSTNAMES = SSD_HOSTS + SPINNING_RUST_HOSTS
+ALL_HOSTNAMES.sort()
 
 # Copied from sync_dns.py - perhaps we should have a lightweight library
 def in_parallel(func, args, verbose):
@@ -21,15 +37,18 @@ def in_parallel(func, args, verbose):
         t.start()
         threads.append(t)
     prev_logged = -1
-    while threads:
+    while len(threads) > 0:
         if len(threads) != prev_logged:
             if verbose:
-                sys.stderr.write("Waiting for %d remote job%s to complete [%s]\n" % (len(threads),
+                sys.stderr.write(
+                    "Waiting for %d remote job%s to complete [%s]\n" % (len(threads),
                     len(threads) != 1 and "s" or "",
-                    ' '.join(t.getName() for t in threads)))
+                    ' '.join(t.getName() for t in threads))
+                )
+                sys.stderr.flush()
             prev_logged = len(threads)
         threads[0].join(1)
-        threads = filter(lambda x: x.isAlive(), threads)
+        threads = list(filter(lambda x: x.is_alive(), threads))
 
 
 ### status module
@@ -47,29 +66,37 @@ states = {
 def pprint_table(table):
     """Prints out a table of data, padded for alignment
     @param table: The table to print. A list of lists. Each row must have the same number of columns.
-    """ 
+    """
 
     col_paddings = []
     for i in range(len(table[0])):
         col_paddings.append(max([len(str(row[i])) for row in table]))
 
     for row in table:
-        print row[0].ljust(col_paddings[0] + 1),
+        sys.stdout.write(row[0].ljust(col_paddings[0] + 1))
         for i in range(1, len(row)):
-            print str(row[i]).ljust(col_paddings[i] + 2),
-        print
+            sys.stdout.write(str(row[i]).ljust(col_paddings[i] + 2))
+        sys.stdout.flush()
+        print('')
 
 containers = []
+#host_os_ver = {}
 def gather_data_onehost(host):
 
-    conn = libvirt.openReadOnly("lxc+ssh://" + host)
-    for domain in map(conn.lookupByName, conn.listDefinedDomains()) + map(conn.lookupByID, conn.listDomainsID()):
+    #these are libvirt 4.5 hosts
+    if host in []:
+        url = "lxc+ssh://" + host + "/system"
+    else:
+        url = "lxc+ssh://" + host
+
+    conn = libvirt.openReadOnly(url)
+    for domain in list(map(conn.lookupByName, conn.listDefinedDomains())) + list(map(conn.lookupByID, conn.listDomainsID())):
         state, maxmem, mem, ncpu, cputime = domain.info()
         containers.append({
             'host': host,
             'name': domain.name(),
             'state': states.get(state, state),
-            'maxmem': maxmem // 1000, 
+            'maxmem': maxmem // 1000,
             'usedmem': mem // 1000,
             'ncpu': ncpu,
             'cputime': cputime // 1000000000,
@@ -82,7 +109,11 @@ def cmd_status():
     blankline = ["","","","","",""]
     output = [ containers_header, blankline ]
     for host in ALL_HOSTNAMES:
-        output.extend([[host, "","","",""],["===================", "","","","",""]])
+        if host in SSD_HOSTS:
+            hosttext = host + " (SSD)"
+        else:
+            hosttext = host
+        output.extend([[hosttext,"","","","",""],["===================","","","","",""]])
         hostoutput = [ ]
         hostsummary = { 'maxmem': 0, 'usedmem': 0, 'ncpu': 0 }
         for row in containers:
@@ -90,26 +121,65 @@ def cmd_status():
                 hostoutput.append([row["name"], row["state"], row["maxmem"],
                 str(row["usedmem"]) + (" " * (5 - len(str(row["usedmem"])))) + " (" + ( str(int(100*(row["usedmem"]/row["maxmem"]))) ) + " %)",
                 row["ncpu"], row["cputime"] ])
-                
+
                 hostsummary['maxmem'] += row["maxmem"]
                 hostsummary['usedmem'] += row["usedmem"]
                 hostsummary['ncpu'] += row["ncpu"]
-              
+
         # sort by ncpu reverse, then name
         hostoutput = sorted(hostoutput, key=lambda x: (-x[4], x[0]))
-        if hostoutput: 
+        if hostoutput:
             output.extend(hostoutput)
             output.append(blankline)
             output.append(["total:", "", str(hostsummary['maxmem']), str(hostsummary['usedmem']), str(hostsummary['ncpu']), ""])
         output.append(blankline)
     pprint_table(output)
 
+def cmd_status_csv():
+    '''status output in CSV format'''
+    in_parallel(gather_data_onehost, ALL_HOSTNAMES, verbose=True)
+    containers_header = ["host", "name", "state", "max mem (MB)", "CPU cores" ]
+    blankline = ""
+    output = [ containers_header, blankline ]
+    for host in ALL_HOSTNAMES:
+        hostoutput = [ ]
+        hostsummary = { 'maxmem': 0, 'usedmem': 0, 'ncpu': 0 }
+        for row in containers:
+            if row["host"] == host:
+                hostoutput.append([ row["host"], row["name"], row["state"], row["maxmem"], row["ncpu"] ])
+                hostsummary['maxmem'] += row["maxmem"]
+                hostsummary['ncpu'] += row["ncpu"]
+        # sort by ncpu reverse, then name
+        hostoutput = sorted(hostoutput, key=lambda x: (-x[4], x[0]))
+        if hostoutput:
+            output.extend(hostoutput)
+            output.append([host, "", "", str(hostsummary['maxmem']), str(hostsummary['ncpu'])])
+        output.append(blankline)
+    for line in output:
+        print( ','.join([str(i) for i in line]) )
+
+def cmd_status_summary_csv():
+    '''summary output in CSV format'''
+    in_parallel(gather_data_onehost, ALL_HOSTNAMES, verbose=True)
+    containers_header = ["host", "max mem (MB)", "CPU cores" ]
+    output = [ containers_header ]
+    for host in ALL_HOSTNAMES:
+        hostsummary = { 'maxmem': 0, 'usedmem': 0, 'ncpu': 0 }
+        for row in containers:
+            if row["host"] == host:
+                hostsummary['maxmem'] += row["maxmem"]
+                hostsummary['ncpu'] += row["ncpu"]
+        output.append([host, str(hostsummary['maxmem']), str(hostsummary['ncpu'])])
+    for line in output:
+        print( ','.join([str(i) for i in line]) )
+
+
 
 ### hostlist module
 
 def cmd_hostlist():
     '''print a list of ShareDB hosts, suitable for use with pssh'''
-    print '\n'.join(ALL_HOSTNAMES)
+    print('\n'.join(ALL_HOSTNAMES))
 
 
 ### guestlist module
@@ -123,7 +193,7 @@ def cmd_guestlist(host=None):
     output = [ ]
     for row in containers:
         output.append(row["name"])
-    print "\n".join(sorted(output))
+    print("\n".join(sorted(output)))
 
 def cmd_guestlist_by_dc(data_center):
     '''print a list of (running) ShareDB guests in specified DC, suitable for use with pssh'''
@@ -131,47 +201,72 @@ def cmd_guestlist_by_dc(data_center):
     output = [ ]
     for row in containers:
         output.append(row["name"])
-    print "\n".join(sorted(output))
+    print("\n".join(sorted(output)))
 
+def cmd_find_guest(name):
+    '''find the sharedb host of a given container name'''
+    in_parallel(gather_data_onehost, ALL_HOSTNAMES, verbose=False)
+    row = next(x for x in containers if x['name'] == name)
+    print(row['host'])
+
+def cmd_known_hosts():
+    '''add all sharedb hosts to ~/.ssh/known_hosts file'''
+    for host in ALL_HOSTNAMES:
+        print(host)
+        subprocess.call([
+            'ssh',
+            '-o', 'StrictHostKeyChecking no',
+            host,
+            'exit'
+        ])
 
 def main():
     try:
         opts, args = getopt.gnu_getopt(sys.argv[1:], "h", ["help"])
         for o, a in opts:
             if o == "-h" or o == "--help":
-                raise getopt.GetoptError, "Show help"
+                raise getopt.GetoptError("Show help")
             else:
-                print "Unhandled option: " + o + ": " + a
+                print("Unhandled option: " + o + ": " + a)
         if len(args) == 0:
             command = cmd_status
         else:
             command = globals().get('cmd_' + args[0], None)
         if command is None:
-            raise getopt.GetoptError, "No such command '%s'" % args[0]
+            raise getopt.GetoptError("No such command '%s'" % args[0])
         command(*args[1:])
-    except getopt.GetoptError, e:
-        print "Usage: %s [OPTION]... cmd" % sys.argv[0]
-        print '''
+        sys.stdout.flush()
+    except getopt.GetoptError as e:
+        print("Usage: %s [OPTION]... cmd" % sys.argv[0])
+        print('''
 Options:
     -h, --help       Display this help
 
-Commands:'''
+Commands:''')
         scope = globals()
         commands = [(x[4:], scope[x]) for x in scope if x.startswith('cmd_')]
         commands.sort()
         for name, cmdfunc in commands:
             nameopts = [name]
-            for i in xrange(cmdfunc.func_code.co_argcount):
-                varname = cmdfunc.func_code.co_varnames[i]
-                if i >= cmdfunc.func_code.co_argcount - len(cmdfunc.func_defaults or ()):
+
+            try:
+                func_code = cmdfunc.func_code
+                func_defaults = cmdfunc.func_defaults
+            except AttributeError as x:
+                func_code = cmdfunc.__code__
+                func_defaults = cmdfunc.__defaults__
+
+            for i in xrange(func_code.co_argcount):
+                varname = func_code.co_varnames[i]
+                if i >= func_code.co_argcount - len(func_defaults or ()):
                     varname = "[" + varname + "]"
                 nameopts.append(varname)
-            print "    " + " ".join(nameopts)
-            print textwrap.fill(textwrap.dedent(cmdfunc.__doc__), width=80,
-                    initial_indent=' '*4, subsequent_indent=' '*4)
-            print
-        print '''
-Error: %s''' % e
+            print("    " + " ".join(nameopts))
+            print(textwrap.fill(textwrap.dedent(cmdfunc.__doc__), width=80,
+                initial_indent=' '*4, subsequent_indent=' '*4))
+            print('')
+        print('''
+Error: %s''' % e)
 
 
 if __name__ == '__main__':
