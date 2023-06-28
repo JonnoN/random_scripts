@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+if [ "$#" -lt 1 ]; then
+    echo >&2 "usage: $0 domain command..."
+    exit 1
+fi
+domain=$1
+shift
+domid=$(virsh domid "$domain")
+pid=$(pgrep -P "$domid")
+nsenter -t "$pid" -m -u -n -i -p -- "$@"
